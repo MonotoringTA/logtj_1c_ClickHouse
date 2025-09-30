@@ -1,0 +1,41 @@
+﻿<?xml version="1.0"?>
+<config xmlns="http://v8.1c.ru/v8/tech-log">
+	
+	<log location="/var/log/1c/full" history="2">
+		<event>
+			<eq property="Name" value="VRSREQUEST"/>
+		</event>
+		<event>
+			<eq property="Name" value="VRSRESPONSE"/>
+		</event>
+		<event>
+			<eq property="Name" value="DBMSSQL"/>
+		</event>
+		<event>
+			<eq property="Name" value="DBPOSTGRS"/>
+		</event>
+		<event>
+			<eq property="Name" value="CALL"/>
+		</event>
+		<event>
+			<eq property="Name" value="SCALL"/>
+		</event>
+		<event>
+			<eq property="Name" value="TLOCK"/>
+		</event>
+		<event>
+			<eq property="Name" value="SESN"/>
+		</event>
+		<event>
+			<eq property="Name" value="TDEADLOCK"/>
+		</event>
+		<event>
+			<eq property="Name" value="TTIMEOUT"/>
+		</event>
+		<event>
+			<eq property="Name" value="EXCP"/>
+		</event>
+		<property name="all"/>
+	</log> 
+	
+</config>

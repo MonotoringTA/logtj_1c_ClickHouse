@@ -1,0 +1,21 @@
+{
+  "clickhouse": {
+    "url": "http://127.0.0.1:8123",
+    "user": "monitoring",
+    "password": "123",
+    "database": "tracelog"
+  },
+  "processing": {
+    "batch_size": 100,
+    "timeout": 30,
+    "dataset_name": "rdv"
+  },
+  "filtering": {
+    "min_operation_duration_ms": 1000,
+    "min_operation_events": 3
+  },
+  "paths": {
+    "input_dir": "C:\\rdv\\log-full",
+    "log_dir": "C:\\rdv\\log-full-tracelog"
+  }
+}
