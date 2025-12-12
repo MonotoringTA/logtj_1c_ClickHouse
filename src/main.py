@@ -8,7 +8,6 @@ import json
 import gzip
 import requests
 import logging
-import os
 import shutil
 import heapq
 from collections import defaultdict
@@ -50,6 +49,8 @@ CLICKHOUSE_DATABASE = config["clickhouse"]["database"]
 BATCH_SIZE = config["processing"]["batch_size"]
 TIMEOUT = config["processing"]["timeout"]
 DATASET_NAME = config["processing"]["dataset_name"]
+PROCESS_CLIENT_SERVER_OPS = config["processing"]["client_server_operations"]
+PROCESS_BACKGROUND_JOBS = config["processing"]["background_jobs"]
 
 # --- Ограничения фильтрации операций ---
 MIN_OPERATION_DURATION_MS = config["filtering"]["min_operation_duration_ms"]
@@ -66,7 +67,7 @@ TABLE_EVENT_STATS = "event_stats"
 
 # --- Компиляция регулярных выражений ---
 EVENT_START_RE = re.compile(r"^(\d{2}):(\d{2})\.(\d{6})-(\d+),([A-Za-z]+),")
-PROPS_PATTERN = re.compile(r"\b(t:clientID|SessionID|Usr)=([^,\r\n]+)")
+PROPS_PATTERN = re.compile(r"\b(t:clientID|SessionID|Usr|t:connectID|Appl|Func|Nmb)=([^,\r\n]+)")
 CONTEXT_PATTERN = re.compile(r',Context=(?:"([^"]*)"|\'([^\']*)\'|([^,\r\n]+))', re.DOTALL)
 
 
@@ -123,9 +124,18 @@ def update_op_props(op: dict, props: dict) -> None:
     """Обновляет session в active_ops, если они ещё не заданы."""
     if not op.get("session"):
         session_id = props.get("SessionID")
-        # Проверяем что SessionID существует и состоит только из цифр
         if session_id and session_id.isdigit():
             op["session"] = session_id
+
+    if not op.get("connect"):
+        connect_id = props.get("t:connectID")        
+        if connect_id and connect_id.isdigit():
+            op["connect"] = connect_id
+
+    if not op.get("client"):
+        client_id = props.get("t:clientID")        
+        if client_id and client_id.isdigit():
+            op["client"] = client_id
 
 def extract_first_field(events: list, key: str) -> str | None:
     for event in events:
@@ -247,7 +257,7 @@ def calculate_event_stats(op: dict) -> dict:
         event_name = meta["event_name"]
         
         # Исключаем VRSREQUEST и VRSRESPONSE из статистики
-        if event_name in ("VRSREQUEST", "VRSRESPONSE"):
+        if event_name in ("VRSREQUEST", "VRSRESPONSE", "SESN"):
             continue
             
         duration_us = int(meta["duration"])
@@ -262,12 +272,11 @@ def calculate_event_stats(op: dict) -> dict:
             }
     
     # Вычисляем общую длительность всех событий
-    total_events_duration = sum(stats["total_duration_us"] for stats in event_stats.values())
+    op_duration_us = to_int_safe(op.get("duration_us"), 0)
     
-    # Добавляем процент к каждому типу события
     for event_name, stats in event_stats.items():
         duration_us = stats["total_duration_us"]
-        percentage = round(duration_us * 100.0 / total_events_duration, 2) if total_events_duration > 0 else 0.0
+        percentage = round(duration_us * 100.0 / op_duration_us, 2) if op_duration_us > 0 else 0.0
         stats["percentage"] = percentage
     
     return event_stats
@@ -297,6 +306,24 @@ def discover_rphost_groups(input_dir: str) -> dict[str, list[str]]:
 
     return dict(groups)
 
+def discover_rmngr_groups(input_dir: str) -> dict[str, list[str]]:
+    """
+    Рекурсивно ищет каталоги rmngr_* в input_dir.
+    Если input_dir уже является каталогом rmngr_*, возвращает только его.
+    """
+    groups = defaultdict(list)
+    root = Path(input_dir).resolve()
+
+    if root.name.startswith("rmngr_") and root.is_dir():
+        groups[root.name].append(str(root))
+        return dict(groups)
+
+    for rmngr_dir in root.rglob("rmngr_*"):
+        if rmngr_dir.is_dir():
+            groups[rmngr_dir.name].append(str(rmngr_dir))
+
+    return dict(groups)
+
 def group_files_by_hour(files: list[str]) -> dict[str, list[str]]:
     """
     Группирует список файлов по часу.
@@ -310,10 +337,14 @@ def group_files_by_hour(files: list[str]) -> dict[str, list[str]]:
             grouped[hour_key].append(fp)
     return grouped
 
+def is_rmngr_path(path: str) -> bool:
+    """Возвращает True, если путь относится к каталогу rmngr_*."""
+    return any(part.startswith("rmngr_") for part in Path(path).parts)
+
 def iter_events(file_path: str):
     """
     Итератор событий из одного файла.
-    Возвращает кортеж (ts: datetime, event_text: str), где event_text – событие целиком.
+    Возвращает кортеж (ts: datetime, event_meta: dict, event_text: str), где event_text – событие целиком.
     """
     filename = Path(file_path).name
     buffer: list[str] = []
@@ -327,7 +358,7 @@ def iter_events(file_path: str):
                     # закончим предыдущее событие
                     if buffer and event_meta:
                         ts = build_ts(filename, event_meta)
-                        yield ts, "".join(buffer)
+                        yield ts, event_meta, "".join(buffer)
                         buffer.clear()
                     # начнем новое
                     event_meta = ev_start
@@ -338,7 +369,7 @@ def iter_events(file_path: str):
             # хвост
             if buffer and event_meta:
                 ts = build_ts(filename, event_meta)
-                yield ts, "".join(buffer)
+                yield ts, event_meta, "".join(buffer)
 
     except Exception as e:
         print(f"[WARN] Ошибка чтения {file_path}: {e}")
@@ -349,18 +380,27 @@ def merge_hour_events(hour_files: list[str], out_file: Path) -> int:
     Имя out_file должно быть вида <YYMMDDHH>.log (без суффиксов).
     Возвращает количество записанных событий.
     """
-    # heap элементов: (ts, idx, text, gen)
+    # heap элементов: (ts, idx, meta, text, gen, is_rmngr)
     # idx нужен для устойчивости сравнения при равных ts
-    heap: list[tuple[datetime, int, str, object]] = []
+    heap: list[tuple[datetime, int, dict, str, object, bool]] = []
     idx_counter = 0
+
+    def next_allowed(gen, is_rmngr: bool):
+        """Возвращает следующее нужное событие, пропуская нерелевантные для rmngr."""
+        while True:
+            ts_val, meta_val, text_val = next(gen)
+            if is_rmngr and meta_val.get("event_name") != "SESN":
+                continue
+            return ts_val, meta_val, text_val
 
     # подготовим генераторы и закинем по первому событию в кучу
     gens = []
     for fp in hour_files:
         gen = iter_events(fp)
         try:
-            ts, text = next(gen)
-            heapq.heappush(heap, (ts, idx_counter, text, gen))
+            is_rmngr = is_rmngr_path(fp)
+            ts, event_meta, text = next_allowed(gen, is_rmngr)
+            heapq.heappush(heap, (ts, idx_counter, event_meta, text, gen, is_rmngr))
             idx_counter += 1
             gens.append(gen)
         except StopIteration:
@@ -370,17 +410,54 @@ def merge_hour_events(hour_files: list[str], out_file: Path) -> int:
     count = 0
     with open(out_file, "w", encoding="utf-8-sig") as out:
         while heap:
-            ts, _, text, gen = heapq.heappop(heap)
+            ts, _, _, text, gen, is_rmngr = heapq.heappop(heap)
             out.write(text)
             count += 1
             try:
-                ts2, text2 = next(gen)
-                heapq.heappush(heap, (ts2, idx_counter, text2, gen))
+                ts2, meta2, text2 = next_allowed(gen, is_rmngr)
+                heapq.heappush(heap, (ts2, idx_counter, meta2, text2, gen, is_rmngr))
                 idx_counter += 1
             except StopIteration:
                 pass
 
     return count
+
+def iter_read_events(hour_files: list[str]):
+    """
+    Потоково отдает события из файлов одного часа.
+    Возвращает кортеж (ts, event_meta, event_text, source_path), при этом в памяти
+    держится только по одному событию от каждого файла.
+    """
+    heap: list[tuple[datetime, int, int, dict, str, object, str, bool]] = []
+    order_counter = 0
+
+    def next_allowed(gen, is_rmngr: bool):
+        """Возвращает следующее нужное событие, пропуская нерелевантные для rmngr."""
+        while True:
+            ts_val, meta_val, text_val = next(gen)
+            if is_rmngr and meta_val.get("event_name") != "SESN":
+                continue
+            return ts_val, meta_val, text_val
+
+    for idx, fp in enumerate(sorted(hour_files)):
+        gen = iter_events(fp)
+        try:
+            is_rmngr = is_rmngr_path(fp)
+            ts, event_meta, text = next_allowed(gen, is_rmngr)
+            heapq.heappush(heap, (ts, idx, order_counter, event_meta, text, gen, fp, is_rmngr))
+            order_counter += 1
+        except StopIteration:
+            continue
+
+    while heap:
+        ts, idx, _, event_meta, text, gen, fp, is_rmngr = heapq.heappop(heap)
+        yield ts, event_meta, text, fp
+        try:
+            ts_next, meta_next, text_next = next_allowed(gen, is_rmngr)
+            heapq.heappush(heap, (ts_next, idx, order_counter, meta_next, text_next, gen, fp, is_rmngr))
+            order_counter += 1
+        except StopIteration:
+            pass
 
 def build_temp_for_multi(input_dir: str, temp_dir: str) -> None:
     temp_root = Path(temp_dir)
@@ -389,17 +466,23 @@ def build_temp_for_multi(input_dir: str, temp_dir: str) -> None:
     temp_root.mkdir(parents=True, exist_ok=True)
 
     rphost_groups = discover_rphost_groups(input_dir)
-    print(f"[INFO] Найдено процессов: {len(rphost_groups)} – {', '.join(sorted(rphost_groups.keys()))}")
+    rmngr_groups = discover_rmngr_groups(input_dir) if PROCESS_BACKGROUND_JOBS else {}
 
-    for proc_name, rphost_dirs in sorted(rphost_groups.items()):
-        print(f"[INFO] Процесс {proc_name}: каталогов {len(rphost_dirs)}")
+    all_groups = {}
+    all_groups.update(rphost_groups)
+    all_groups.update(rmngr_groups)
+
+    print(f"[INFO] Найдено процессов: {len(all_groups)} - {', '.join(sorted(all_groups.keys()))}")
+
+    for proc_name, proc_dirs in sorted(all_groups.items()):
+        print(f"[INFO] Процесс {proc_name}: каталогов {len(proc_dirs)}")
         # соберем все .log этого процесса из всех типовых каталогов
         all_logs: list[str] = []
-        for d in rphost_dirs:
+        for d in proc_dirs:
             all_logs.extend(sorted(glob.glob(str(Path(d) / "*.log"))))
 
         if not all_logs:
-            print(f"[WARN] У процесса {proc_name} нет логов – пропускаю")
+            print(f"[WARN] У процесса {proc_name} нет логов - пропускаю")
             continue
 
         # сгруппируем по часу
@@ -410,7 +493,7 @@ def build_temp_for_multi(input_dir: str, temp_dir: str) -> None:
         for hour_key, hour_files in sorted(by_hour.items()):
             out_file = out_proc_dir / f"{hour_key}.log"   # без суффиксов
             cnt = merge_hour_events(hour_files, out_file)
-            print(f"[INFO]   {proc_name}/{out_file.name}: {cnt:,} событий из {len(hour_files)} файлов")
+            print(f"[INFO]   {proc_name}/{out_file.name}: объединено {cnt:,} событий из {len(hour_files)} файлов")
 
     print(f"[INFO] Временная структура собрана: {temp_root}")
 
@@ -420,197 +503,212 @@ def build_temp_for_multi(input_dir: str, temp_dir: str) -> None:
 # ============================================================
 
 def process_logs(input_dir: str) -> None:
-    files = sorted(glob.glob(str(Path(input_dir) / "**" / "rphost_*"  / "*.log"), recursive=True))
-    logger.info(f"Начинаем обработку {len(files)} файлов")
-    print(f"[INFO] Найдено {len(files)} лог-файлов для обработки")
-    
+    # Читаем и rphost_*, и rmngr_* в режиме single
+    rphost_files = glob.glob(str(Path(input_dir) / "**" / "rphost_*" / "*.log"), recursive=True)
+    rmngr_files = glob.glob(str(Path(input_dir) / "**" / "rmngr_*" / "*.log"), recursive=True) if PROCESS_BACKGROUND_JOBS else []
+    files = sorted(set(rphost_files + rmngr_files))
+
+    logger.info(f"Найдено файлов rphost: {len(rphost_files)}, rmngr: {len(rmngr_files)}")
+    print(f"[INFO] Найдено файлов rphost: {len(rphost_files)}, rmngr: {len(rmngr_files)}")
+
     if not files:
-        logger.warning("Не найдено лог-файлов для обработки")
-        print("[WARN] Не найдено лог-файлов для обработки")
+        logger.warning("Нет входных файлов rphost_/rmngr_* для обработки")
+        print("[WARN] Нет входных файлов rphost_/rmngr_* для обработки")
         return
-    
+
+    by_hour = group_files_by_hour(files)
+    print(f"[INFO] Часовых групп: {len(by_hour)}")
+    logger.info(f"Часовых групп: {len(by_hour)}")
+
     active_ops: Dict[str, Dict] = {}
     batch_ops, batch_events, batch_event_stats = [], [], []
     total_operations = 0
 
-    # Прогресс для каждого файла отдельно
-    for file_idx, file in enumerate(files, 1):
-        file_name = Path(file).name
-        file_size_mb = Path(file).stat().st_size / (1024 * 1024)
-        
-        print(f"\n[INFO] Файл {file_idx}/{len(files)}: {file_name} ({file_size_mb:.1f} МБ)")
-        logger.info(f"Обрабатываем файл {file_idx}/{len(files)}: {file_name} ({file_size_mb:.1f} МБ)")
-        
-        # Подсчитываем строки для прогресс-бара
-        print("[INFO] Подсчет строк в файле...")
-        total_lines = get_file_line_count(file)
-        
-        if total_lines == 0:
-            print("[WARN] Не удалось подсчитать строки или файл пуст")
-            continue
-            
-        print(f"[INFO] Обработка {total_lines:,} строк...")
-        
-        # Прогресс-бар для строк текущего файла
-        line_progress = tqdm(
-            total=total_lines,
-            desc=f"Файл {file_idx}/{len(files)}: {file_name[:30]}",
+    def handle_event(event_meta: dict, event_text: str, ts_event: datetime):
+        """Обрабатывает одно событие, обновляя активные операции и пачки."""
+        event_name = event_meta["event_name"]
+        if event_name in ("VRSREQUEST", "VRSRESPONSE") and not PROCESS_CLIENT_SERVER_OPS:
+            return
+        if event_name == "SESN" and not PROCESS_BACKGROUND_JOBS:
+            return
+
+        def complete_operation(op_key: str) -> None:
+            """
+            Добавляет текущее событие в операцию, ставит ts_vrsresponse, считает длительность,
+            применяет фильтры, пушит батчи и убирает запись из active_ops.
+            """
+            nonlocal total_operations  # нужен для инкремента счётчика операций
+            op = active_ops[op_key]
+            update_op_props(op, props)
+            op["events"].append({"meta": event_meta, "props": props, "text": event_text, "ts": ts_event})
+            op["ts_vrsresponse"] = ts_event
+
+            delta = op["ts_vrsresponse"] - op["ts_vrsrequest"]
+            op["duration_us"] = delta.days * 86_400_000_000 + delta.seconds * 1_000_000 + delta.microseconds
+
+            duration_us = op.get("duration_us", 0)
+            events_count = len(op["events"])
+            min_duration_us = MIN_OPERATION_DURATION_MS * 1000
+            if duration_us < min_duration_us or events_count < MIN_OPERATION_EVENTS:
+                del active_ops[op_key]
+                return
+
+            if op.get("session"):
+                total_operations += 1
+
+                batch_ops.append({
+                    "session_id": to_int_safe(op.get("session")),
+                    "connect_id": to_int_safe(op.get("connect")),
+                    "client_id": to_int_safe(op.get("client")),
+                    "user": extract_first_field(op["events"], "Usr"),
+                    "ts_vrsrequest_us": op["ts_vrsrequest"].isoformat(timespec="microseconds"),
+                    "ts_vrsresponse_us": op["ts_vrsresponse"].isoformat(timespec="microseconds"),
+                    "ts_vrsrequest": op["ts_vrsrequest"].replace(microsecond=0).isoformat(),
+                    "ts_vrsresponse": op["ts_vrsresponse"].replace(microsecond=0).isoformat(),
+                    "duration_us": to_int_safe(op.get("duration_us", 0)),
+                    "context": extract_first_field(op["events"], "Context"),
+                })
+
+                prev_ts = None
+                for ev_data in op["events"]:
+                    ts = ev_data["ts"]
+                    meta = ev_data["meta"]
+                    props_inner = ev_data["props"]
+                    event_string = ev_data["text"]
+                    space = int((ts - prev_ts).total_seconds() * 1_000_000 - int(meta["duration"])) if prev_ts else 0
+                    prev_ts = ts
+
+                    row = {
+                        "session_id": to_int_safe(op.get("session")),
+                        "connect_id": to_int_safe(op.get("connect")),
+                        "client_id": to_int_safe(op.get("client")),
+                        "user": props_inner.get("Usr"),
+                        "ts_vrsrequest_us": op["ts_vrsrequest"].isoformat(timespec="microseconds"),
+                        "ts_vrsresponse_us": op["ts_vrsresponse"].isoformat(timespec="microseconds"),
+                        "ts_event_us": ts.isoformat(timespec="microseconds"),
+                        "ts_event": ts.replace(microsecond=0).isoformat(),
+                        "event_name": meta["event_name"],
+                        "duration_us": int(meta["duration"]),
+                        "space_us": space,
+                        "event_string": event_string,
+                        "context": props_inner.get("Context"),
+                    }
+                    batch_events.append(row)
+
+                event_stats = calculate_event_stats(op)
+                for event_name, stats in event_stats.items():
+                    batch_event_stats.append({
+                        "session_id": to_int_safe(op.get("session")),
+                        "connect_id": to_int_safe(op.get("connect")),
+                        "client_id": to_int_safe(op.get("client")),
+                        "ts_vrsrequest_us": op["ts_vrsrequest"].isoformat(timespec="microseconds"),
+                        "ts_vrsresponse_us": op["ts_vrsresponse"].isoformat(timespec="microseconds"),
+                        "event_name": event_name,
+                        "total_duration_us": stats["total_duration_us"],
+                        "count": stats["count"],
+                        "percentage": stats["percentage"],
+                    })
+
+            del active_ops[op_key]
+
+        def start_operation(op_key: str, session_value: str | None, connect_value: str | None) -> None:
+            """
+            Инициализирует новую операцию (VRSREQUEST/SESN Start): кладёт первую точку и обновляет props.
+            extra_fields позволяет добавить специфичные поля без дублирования кода.
+            """
+            if op_key in active_ops:
+                return
+            active_ops[op_key] = {
+                "session": session_value,
+                "connect": connect_value,
+                "ts_vrsrequest": ts_event,
+                "events": [{"meta": event_meta, "props": props, "text": event_text, "ts": ts_event}],
+            }
+            update_op_props(active_ops[op_key], props)
+
+        props = extract_props(event_text)
+        client_id = props.get("t:clientID")
+        session_id = props.get("SessionID")
+        connect_id = props.get("t:connectID")
+                  
+        if event_name == "VRSREQUEST":
+            start_operation(client_id, session_id, connect_id)
+
+        elif event_name == "VRSRESPONSE":
+            if client_id in active_ops:
+                complete_operation(client_id)
+
+        elif event_name == "SESN":
+           
+            func = props.get("Func")
+            appl = props.get("Appl")
+            session_id = props.get("Nmb")
+
+            if func == "Start" and appl == "BackgroundJob":
+                start_operation(session_id, session_id, connect_id)
+
+            elif func == "Finish" and session_id in active_ops: 
+                complete_operation(session_id)
+
+        else:
+            if client_id in active_ops:
+                op = active_ops[client_id]
+            elif session_id in active_ops:
+                op = active_ops[session_id]
+            else:
+                return            
+            update_op_props(op, props)
+            op["events"].append({"meta": event_meta, "props": props, "text": event_text, "ts": ts_event})
+
+        if len(batch_events) >= BATCH_SIZE:
+            insert_batch(TABLE_OPERATIONS, batch_ops)
+            insert_batch(TABLE_EVENTS, batch_events)
+            insert_batch(TABLE_EVENT_STATS, batch_event_stats)
+            batch_events.clear()
+            batch_ops.clear()
+            batch_event_stats.clear()
+
+    total_hours = len(by_hour)
+    for hour_idx, (hour_key, hour_files) in enumerate(sorted(by_hour.items()), start=1):
+        print(f"\n[INFO] Час {hour_key}: файлов {len(hour_files)} (rphost+rmngr)")
+        logger.info(f"Начало обработки часа {hour_key}: {len(hour_files)} файлов")
+
+        # Прогресс-бар по строкам всех файлов часа
+        total_lines_hour = sum(get_file_line_count(fp) for fp in hour_files)
+        with tqdm(
+            total=total_lines_hour if total_lines_hour > 0 else None,
+            desc=f"Час {hour_idx}/{total_hours}",
             unit="строк",
             unit_scale=True
-        )
-        with Path(file).open("r", encoding="utf-8-sig", errors="ignore") as f:
-            buffer: List[str] = []
-            event_meta: dict | None = None
-            current_filename = Path(file).name
+        ) as pbar:
+            lines_since_update = 0
+            for ts_event, event_meta, event_text, _ in iter_read_events(hour_files):
+                if not event_meta:
+                    continue
+                handle_event(event_meta, event_text, ts_event)
 
-            def process_previous_buffer():
-                nonlocal buffer, event_meta, total_operations
-                if not buffer or event_meta is None:
-                    return
-                event_text = "".join(buffer)
-                props = extract_props(event_text)
-                client_id = props.get("t:clientID")
-                session_id = props.get("SessionID")
-                ts_event = build_ts(current_filename, event_meta)
+                # обновляем прогресс каждые 10k прочитанных строк
+                lines_in_event = max(1, event_text.count("\n"))
+                lines_since_update += lines_in_event
+                if lines_since_update >= 10_000:
+                    pbar.update(lines_since_update)
+                    pbar.set_postfix({"Операции": total_operations})
+                    lines_since_update = 0
 
-                if client_id:
-                    if event_meta["event_name"] == "VRSREQUEST":
-                        active_ops[client_id] = {
-                            "session": session_id,
-                            "ts_vrsrequest": ts_event,
-                            "events": [{"meta": event_meta, "props": props, "text": event_text, "ts": ts_event}],
-                        }
-                        update_op_props(active_ops[client_id], props)
+            if lines_since_update:
+                pbar.update(lines_since_update)
+                pbar.set_postfix({"Операции": total_operations})
 
-                    elif event_meta["event_name"] == "VRSRESPONSE":
-                        if client_id in active_ops:
-                            op = active_ops[client_id]
-                            update_op_props(op, props)
-                            op["events"].append({"meta": event_meta, "props": props, "text": event_text, "ts": ts_event})
-                            op["ts_vrsresponse"] = ts_event
-                            delta = op["ts_vrsresponse"] - op["ts_vrsrequest"]
-                            op["duration_us"] = delta.days * 86_400_000_000 + delta.seconds * 1_000_000 + delta.microseconds
-                          
-                            # Проверяем ограничения перед сохранением
-                            duration_us = op.get("duration_us", 0)
-                            events_count = len(op["events"])
-                            
-                            # Фильтруем по минимальному времени и количеству событий
-                            min_duration_us = MIN_OPERATION_DURATION_MS * 1000  # конвертируем мс в мкс
-                            if duration_us < min_duration_us or events_count < MIN_OPERATION_EVENTS:
-                                # Пропускаем операцию, не соответствующую критериям
-                                del active_ops[client_id]
-                                return
-
-                            if op.get("session"):
-                                total_operations += 1
-                               
-                                batch_ops.append({
-                                    "session_id": to_int_safe(op.get("session")),
-                                    "client_id": to_int_safe(client_id),
-                                    "user": extract_first_field(op["events"], "Usr"),
-                                    "ts_vrsrequest_us": op["ts_vrsrequest"].isoformat(timespec="microseconds"),
-                                    "ts_vrsresponse_us": op["ts_vrsresponse"].isoformat(timespec="microseconds"),
-                                    "ts_vrsrequest": op["ts_vrsrequest"].replace(microsecond=0).isoformat(),
-                                    "ts_vrsresponse": op["ts_vrsresponse"].replace(microsecond=0).isoformat(),
-                                    "duration_us": to_int_safe(op.get("duration_us", 0)),
-                                    "context": extract_first_field(op["events"], "Context"),
-                                })
-
-                                prev_ts = None
-                                for ev_data in op["events"]:
-                                    # Используем сохраненные временные метки и метаданные
-                                    ts = ev_data["ts"]
-                                    meta = ev_data["meta"]
-                                    props = ev_data["props"]
-                                    event_string= ev_data["text"]
-                                    space = int((ts - prev_ts).total_seconds() * 1_000_000 - int(meta["duration"])) if prev_ts else 0
-                                    prev_ts = ts
-
-                                    row = {
-                                        "session_id": to_int_safe(op.get("session")),
-                                        "client_id": to_int_safe(client_id),
-                                        "user": props.get("Usr"),
-                                        "ts_vrsrequest_us": op["ts_vrsrequest"].isoformat(timespec="microseconds"),
-                                        "ts_vrsresponse_us": op["ts_vrsresponse"].isoformat(timespec="microseconds"),
-                                        "ts_event_us": ts.isoformat(timespec="microseconds"),
-                                        "ts_event": ts.replace(microsecond=0).isoformat(),
-                                        "event_name": meta["event_name"],
-                                        "duration_us": int(meta["duration"]),
-                                        "space_us": space,
-                                        "event_string": event_string,
-                                        "context": props.get("Context")
-                                    }
-                                    batch_events.append(row)
-
-                                 # Вычисляем статистику событий
-                                event_stats = calculate_event_stats(op)
-                                for event_name, stats in event_stats.items():
-                                    batch_event_stats.append({
-                                        "session_id": to_int_safe(op.get("session")),
-                                        "client_id": to_int_safe(client_id),
-                                        "ts_vrsrequest_us": op["ts_vrsrequest"].isoformat(timespec="microseconds"),
-                                        "ts_vrsresponse_us": op["ts_vrsresponse"].isoformat(timespec="microseconds"),
-                                        "event_name": event_name,
-                                        "total_duration_us": stats["total_duration_us"],
-                                        "count": stats["count"],
-                                        "percentage": stats["percentage"]
-                                    })
-                                
-                            del active_ops[client_id]
-
-                    else:
-                        if client_id in active_ops:
-                            op = active_ops[client_id]
-                            update_op_props(op, props)
-                            op["events"].append({"meta": event_meta, "props": props, "text": event_text, "ts": ts_event})
-
-                if len(batch_events) >= BATCH_SIZE:
-                    insert_batch(TABLE_OPERATIONS, batch_ops)
-                    insert_batch(TABLE_EVENTS, batch_events)
-                    insert_batch(TABLE_EVENT_STATS, batch_event_stats)
-                    logger.info(f"Отправлен батч: {len(batch_events)} событий, {len(batch_ops)} операций")
-                    batch_events.clear()
-                    batch_ops.clear()
-                    batch_event_stats.clear()
-
-                buffer = []
-
-            line_count = 0
-            for line in f:
-                line_count += 1
-                # Обновляем прогресс каждые 10000 строк
-                if line_count % 10000 == 0:
-                    line_progress.update(10000)
-                    line_progress.set_postfix({
-                        "Операции": total_operations
-                    })
-                if ev_start := parse_event_start(line):
-                    # обработать ранее накопленный буфер как завершённое событие
-                    process_previous_buffer()
-                    buffer = [line]
-                    event_meta = ev_start
-                else:
-                    buffer.append(line)
-
-            # Обработка последнего буфера файла
-            if buffer:
-                process_previous_buffer()
-        
-        line_progress.close()
-        print(f"[INFO] Файл {file_name} обработан. Операций: {total_operations}")
-    
-    # Финальный батч
     if batch_events or batch_ops or batch_event_stats:
         insert_batch(TABLE_EVENTS, batch_events)
         insert_batch(TABLE_OPERATIONS, batch_ops)
         insert_batch(TABLE_EVENT_STATS, batch_event_stats)
-        logger.info(f"Отправлен финальный батч: {len(batch_events)} событий, {len(batch_ops)} операций")
+        logger.info(f"Отправлена финальная пачка: {len(batch_events)} событий, {len(batch_ops)} операций")
 
     completion_msg = f"Готово: обработано {total_operations} операций"
     logger.info(completion_msg)
     print(f"[INFO] {completion_msg}")
-
+    
 if __name__ == "__main__":
     logger.info(f"Запуск скрипта trace-vrs. Лог сохраняется в: {log_file}")
     print(f"[INFO] Лог сохраняется в: {log_file}")
@@ -621,6 +719,7 @@ if __name__ == "__main__":
     INPUT_DIR = config["paths"]["input_dir"]
     TEMP_DIR = config["paths"].get("temp_dir", str(Path(INPUT_DIR).parent / "temp"))
     MODE = config["processing"].get("mode", "single")
+    CLEANUP_TEMP_DIR = config["processing"].get("cleanup_temp_dir", True)
 
     logger.info(f"Режим обработки: {MODE}")
     print(f"[INFO] Режим обработки: {MODE}")
@@ -635,14 +734,18 @@ if __name__ == "__main__":
             logger.info(f"Старт обработки temp каталога: {TEMP_DIR}")
             print(f"[INFO] Старт обработки temp каталога: {TEMP_DIR}")
             process_logs(TEMP_DIR)
-            # почистить temp
-            try:
-                shutil.rmtree(TEMP_DIR, ignore_errors=True)
-                logger.info(f"Temp удален: {TEMP_DIR}")
-                print(f"[INFO] Temp удален: {TEMP_DIR}")
-            except Exception as e:
-                logger.warning(f"Не удалось удалить temp: {e}")
-                print(f"[WARN] Не удалось удалить temp: {e}")
+            # cleanup temp dir if requested
+            if CLEANUP_TEMP_DIR:
+                try:
+                    shutil.rmtree(TEMP_DIR, ignore_errors=True)
+                    logger.info(f"Temp удален: {TEMP_DIR}")
+                    print(f"[INFO] Temp удален: {TEMP_DIR}")
+                except Exception as e:
+                    logger.warning(f"Не удалось удалить temp: {e}")
+                    print(f"[WARN] Не удалось удалить temp: {e}")
+            else:
+                logger.info(f"Temp сохранен: {TEMP_DIR}")
+                print(f"[INFO] Temp сохранен: {TEMP_DIR}")
         else:
             # классический режим
             process_logs(INPUT_DIR)
@@ -654,4 +757,3 @@ if __name__ == "__main__":
         logger.error(f"Ошибка выполнения скрипта: {e}", exc_info=True)
         print(f"[ERROR] Ошибка: {e}")
         raise
-

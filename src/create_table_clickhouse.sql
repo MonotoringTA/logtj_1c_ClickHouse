@@ -10,6 +10,7 @@ CREATE TABLE tracelog.operations
 
     session_id            UInt64,
     client_id             UInt64,
+    connect_id             UInt64,
     user                  LowCardinality(String),
     vrs_session           String,
 
@@ -42,6 +43,7 @@ CREATE TABLE tracelog.events
 
     session_id              UInt64,
     client_id               UInt64,
+    connect_id              UInt64,
     user                    LowCardinality(String),
 
     ts_event_us             DateTime64(6, 'UTC'),
@@ -74,6 +76,7 @@ CREATE TABLE tracelog.event_stats
 
     session_id              UInt64,
     client_id               UInt64,
+    connect_id              UInt64,
 
     ts_vrsrequest_us        DateTime64(6, 'UTC'),
     ts_vrsresponse_us       DateTime64(6, 'UTC'),

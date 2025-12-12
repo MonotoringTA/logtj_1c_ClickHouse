@@ -6,10 +6,13 @@
     "database": "tracelog"
   },
   "processing": {
-    "mode": "single",
-    "batch_size": 100,
+    "mode": "multi",
+    "batch_size": 1000,
     "timeout": 30,
-    "dataset_name": "rdv"
+    "dataset_name": "rdv",
+    "cleanup_temp_dir": true,
+    "client_server_operations": false,
+    "background_jobs": true
   },
   "filtering": {
     "min_operation_duration_ms": 1000,
